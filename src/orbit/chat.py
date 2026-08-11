@@ -7,6 +7,7 @@ import typer
 from rich.live import Live
 
 from orbit.mcp_client import MCPError, OrbitMCPClient
+from orbit.memory.policy import MEMORY_SYSTEM_PROMPT
 from orbit.ollama import ChatChunk, OllamaClient, OllamaError, ToolCall
 from orbit.rendering import MarkdownStreamRenderer
 from orbit.settings import Settings
@@ -103,7 +104,9 @@ async def run_chat(
         typer.echo(f"Error: {exc}", err=True)
         return
 
-    messages: list[dict[str, Any]] = []
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": MEMORY_SYSTEM_PROMPT}
+    ]
     view_mode = ViewMode.CONCISE
     context_used = 0
 
