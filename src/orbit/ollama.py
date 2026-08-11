@@ -27,13 +27,67 @@ class OllamaStartError(OllamaError):
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    name: str
+    arguments: dict[str, Any]
+    index: int | None = None
+
+    def as_ollama_message(self) -> dict[str, Any]:
+        function: dict[str, Any] = {
+            "name": self.name,
+            "arguments": self.arguments,
+        }
+        if self.index is not None:
+            function["index"] = self.index
+        return {"type": "function", "function": function}
+
+
+@dataclass(frozen=True)
 class ChatChunk:
     content: str = ""
     thinking: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
     done: bool = False
     total_duration_ns: int | None = None
     prompt_eval_count: int | None = None
     eval_count: int | None = None
+
+
+def _parse_tool_calls(message: dict[str, Any]) -> tuple[ToolCall, ...]:
+    raw_calls = message.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return ()
+
+    calls: list[ToolCall] = []
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict):
+            continue
+        function = raw_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        raw_arguments = function.get("arguments", {})
+        arguments: dict[str, Any]
+        if isinstance(raw_arguments, dict):
+            arguments = raw_arguments
+        elif isinstance(raw_arguments, str):
+            try:
+                parsed = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+            else:
+                arguments = parsed if isinstance(parsed, dict) else {}
+        else:
+            arguments = {}
+
+        raw_index = function.get("index")
+        index = raw_index if isinstance(raw_index, int) and not isinstance(raw_index, bool) else None
+        calls.append(ToolCall(name=name, arguments=arguments, index=index))
+
+    return tuple(calls)
 
 
 class OllamaClient:
@@ -126,8 +180,10 @@ class OllamaClient:
     def chat(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         options: dict[str, int | float],
+        *,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Iterator[ChatChunk]:
         payload: dict[str, Any] = {
             "model": model,
@@ -135,6 +191,8 @@ class OllamaClient:
             "stream": True,
             "think": True,
         }
+        if tools:
+            payload["tools"] = tools
         if options:
             payload["options"] = options
 
@@ -161,6 +219,7 @@ class OllamaClient:
                     message = chunk.get("message")
                     content = ""
                     thinking = ""
+                    tool_calls: tuple[ToolCall, ...] = ()
                     if isinstance(message, dict):
                         raw_content = message.get("content")
                         raw_thinking = message.get("thinking")
@@ -168,6 +227,7 @@ class OllamaClient:
                             content = raw_content
                         if isinstance(raw_thinking, str):
                             thinking = raw_thinking
+                        tool_calls = _parse_tool_calls(message)
 
                     total_duration = chunk.get("total_duration")
                     total_duration_ns = (
@@ -190,10 +250,11 @@ class OllamaClient:
                     )
                     done = chunk.get("done") is True
 
-                    if content or thinking or done:
+                    if content or thinking or tool_calls or done:
                         yield ChatChunk(
                             content=content,
                             thinking=thinking,
+                            tool_calls=tool_calls,
                             done=done,
                             total_duration_ns=total_duration_ns,
                             prompt_eval_count=prompt_tokens,
