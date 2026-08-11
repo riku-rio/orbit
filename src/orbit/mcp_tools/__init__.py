@@ -3,10 +3,10 @@ from __future__ import annotations
 from importlib import import_module
 from pkgutil import iter_modules
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 
-def register_tools(mcp: FastMCP) -> None:
+def register_tools(mcp: MCPServer) -> None:
     """Discover and register every MCP tool module in this package."""
     for module_info in iter_modules(__path__):
         if module_info.name.startswith("_"):
