@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from threading import Lock
 from typing import Any, Sequence
 
@@ -11,6 +12,18 @@ def _exception_detail(exc: Exception) -> str:
     message = str(exc).strip()
     name = type(exc).__name__
     return f"{name}: {message}" if message else name
+
+
+def _configure_transformers_loading() -> None:
+    """Use deterministic, memory-bounded model loading by default.
+
+    Transformers v5 materializes checkpoint tensors asynchronously unless
+    HF_DEACTIVATE_ASYNC_LOAD is enabled. Orbit's memory models are large enough
+    that the async path can create a high peak-memory/native-loading failure on
+    Windows, so prefer sequential materialization. Respect an explicit user
+    override if they set the variable themselves.
+    """
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 
 
 class MemoryModels:
@@ -31,6 +44,7 @@ class MemoryModels:
             if self._embedder is not None:
                 return self._embedder
             try:
+                _configure_transformers_loading()
                 from sentence_transformers import SentenceTransformer
 
                 kwargs: dict[str, Any] = {"local_files_only": True}
@@ -63,6 +77,7 @@ class MemoryModels:
             if self._reranker is not None:
                 return self._reranker
             try:
+                _configure_transformers_loading()
                 from sentence_transformers import CrossEncoder
 
                 kwargs: dict[str, Any] = {"local_files_only": True}
