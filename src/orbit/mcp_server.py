@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from orbit.mcp_tools import register_tools
 
-mcp = FastMCP("orbit")
+mcp = MCPServer("orbit")
 register_tools(mcp)
 
 
