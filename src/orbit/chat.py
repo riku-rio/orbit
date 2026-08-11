@@ -7,6 +7,7 @@ import typer
 from rich.live import Live
 
 from orbit.mcp_client import MCPError, OrbitMCPClient
+from orbit.memory.policy import MEMORY_SYSTEM_PROMPT
 from orbit.ollama import ChatChunk, OllamaClient, OllamaError, ToolCall
 from orbit.rendering import MarkdownStreamRenderer
 from orbit.settings import Settings
@@ -71,6 +72,12 @@ def _show_status(model: str, context_used: int, context_total: int | None) -> No
     console.print(session_status(model, context_used, context_total))
 
 
+def _show_tool_error(message: str) -> None:
+    detail = " ".join(message.split())
+    if detail:
+        console.print(f"  {detail}", style="red")
+
+
 def _assistant_message(
     thinking: str,
     content: str,
@@ -103,7 +110,9 @@ async def run_chat(
         typer.echo(f"Error: {exc}", err=True)
         return
 
-    messages: list[dict[str, Any]] = []
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": MEMORY_SYSTEM_PROMPT}
+    ]
     view_mode = ViewMode.CONCISE
     context_used = 0
 
@@ -253,10 +262,12 @@ async def run_chat(
                         elapsed = perf_counter() - started_at
                         console.print(tool_failed(elapsed))
                         result_content = f"Tool error: {exc}"
+                        _show_tool_error(result_content)
                     else:
                         elapsed = perf_counter() - started_at
                         if result.is_error:
                             console.print(tool_failed(elapsed))
+                            _show_tool_error(result.content)
                         else:
                             console.print(tool_completed(elapsed))
                         result_content = result.content
