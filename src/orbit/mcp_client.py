@@ -73,7 +73,7 @@ class OrbitMCPClient:
                     "function": {
                         "name": tool.name,
                         "description": tool.description or "",
-                        "parameters": tool.inputSchema,
+                        "parameters": tool.input_schema,
                     },
                 }
             )
@@ -98,7 +98,7 @@ class OrbitMCPClient:
         if text_parts:
             content = "\n".join(text_parts)
         else:
-            structured = getattr(result, "structuredContent", None)
+            structured = getattr(result, "structured_content", None)
             content = json.dumps(structured, ensure_ascii=False) if structured is not None else ""
 
-        return MCPToolResult(content=content, is_error=result.isError is True)
+        return MCPToolResult(content=content, is_error=result.is_error is True)
