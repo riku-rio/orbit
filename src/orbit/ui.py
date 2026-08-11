@@ -59,6 +59,25 @@ def duration_footer(duration_seconds: float) -> Text:
     return footer
 
 
+def tool_started(name: str) -> Text:
+    line = Text("⚙ ", style="yellow")
+    line.append("Tool: ", style="bold")
+    line.append(name)
+    return line
+
+
+def tool_completed(duration_seconds: float) -> Text:
+    line = Text("✓ ", style="green")
+    line.append(f"Completed in {duration_seconds:.2f}s")
+    return line
+
+
+def tool_failed(duration_seconds: float) -> Text:
+    line = Text("✗ ", style="red")
+    line.append(f"Failed in {duration_seconds:.2f}s")
+    return line
+
+
 def session_status(
     model: str,
     context_used: int,
