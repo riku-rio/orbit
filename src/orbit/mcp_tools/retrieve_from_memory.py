@@ -12,9 +12,19 @@ def register(mcp: MCPServer) -> None:
     def retrieve_from_memory(query: str, limit: int = 5) -> str:
         """Retrieve semantically relevant persistent memories with dense RAG + reranking.
 
-        Use this when earlier preferences, facts, constraints, decisions, or project
-        context may materially help with the current task. Formulate a semantic query
-        for what you need; do not call this mechanically on every turn.
+        Call this proactively before answering when the request depends on information
+        that may have been stored in previous sessions and is not already available in
+        the current conversation. Strong examples include user identity/profile facts,
+        preferences, prior project decisions/configuration, recurring commands/workflows,
+        "what did I tell you...", "what do I prefer...", "what's my name?", and similar
+        references to prior context. Questions about recurring use of this Orbit harness
+        are also retrieval candidates when the answer may have been taught previously.
+
+        Before claiming that you do not know a user-specific or project-specific fact,
+        or asking the user to repeat it, try this tool once unless the current conversation
+        already contains the answer. Do not call this mechanically for standalone general
+        knowledge or generic tasks such as arithmetic, definitions, or "How do I center a div?".
+        Formulate a semantic query describing the fact or context you need.
         """
         hits = get_memory_service().retrieve(query, limit=limit)
         return json.dumps(
