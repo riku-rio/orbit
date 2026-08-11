@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+
 import typer
 
 from orbit import __version__
 from orbit.chat import run_chat
+from orbit.mcp_client import MCPError, OrbitMCPClient
 from orbit.ollama import (
     OllamaClient,
     OllamaError,
@@ -156,7 +159,6 @@ def open_settings(client: OllamaClient) -> None:
         typer.echo("\n  0. Exit")
 
         choice = typer.prompt("\nSelect setting").strip()
-
         if choice == "0":
             return
         if choice == "1":
@@ -192,6 +194,24 @@ def prepare_ollama(client: OllamaClient) -> None:
         raise typer.Exit(1) from exc
 
 
+async def _run_chat_with_mcp(
+    client: OllamaClient,
+    settings: Settings,
+    *,
+    render_markdown: bool | None,
+) -> None:
+    try:
+        async with OrbitMCPClient() as mcp_client:
+            await run_chat(
+                client,
+                settings,
+                mcp_client,
+                render_markdown=render_markdown,
+            )
+    except MCPError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(
@@ -221,4 +241,10 @@ def main(
 
     prepare_ollama(client)
     current_settings = ensure_model(client, load_settings())
-    run_chat(client, current_settings, render_markdown=False if plain else None)
+    asyncio.run(
+        _run_chat_with_mcp(
+            client,
+            current_settings,
+            render_markdown=False if plain else None,
+        )
+    )
