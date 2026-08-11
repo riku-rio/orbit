@@ -31,6 +31,11 @@ def _server_environment() -> dict[str, str]:
     env = {
         "PYTHONFAULTHANDLER": "1",
         "PYTHONUNBUFFERED": "1",
+        # Transformers v5 uses async tensor materialization by default. On the
+        # Windows memory subprocess this can crash inside spawn_materialize
+        # while loading large safetensor checkpoints. Prefer sequential loading
+        # unless the user explicitly opts back into async loading.
+        "HF_DEACTIVATE_ASYNC_LOAD": os.getenv("HF_DEACTIVATE_ASYNC_LOAD", "1"),
     }
     forwarded_names = {
         "SENTENCE_TRANSFORMERS_HOME",
