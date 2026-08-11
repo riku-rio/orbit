@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from threading import Lock
 from typing import Any, Sequence
 
@@ -111,12 +112,26 @@ class MemoryModels:
                 f"Could not tokenize memory input: {_exception_detail(exc)}"
             ) from exc
 
-        input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
+        if not isinstance(encoded, Mapping):
+            raise MemoryModelError(
+                "Embedding tokenizer returned an unsupported encoding object."
+            )
+
+        input_ids = encoded.get("input_ids")
         if input_ids is None:
             raise MemoryModelError("Embedding tokenizer did not return input_ids.")
-        if input_ids and isinstance(input_ids[0], list):
+
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if input_ids and isinstance(input_ids[0], (list, tuple)):
             input_ids = input_ids[0]
-        return len(input_ids)
+
+        try:
+            return len(input_ids)
+        except TypeError as exc:
+            raise MemoryModelError(
+                "Embedding tokenizer returned invalid input_ids."
+            ) from exc
 
     def _validate_length(self, text: str, *, max_tokens: int, kind: str) -> None:
         model = self._get_embedder()
