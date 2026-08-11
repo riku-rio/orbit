@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+MCP_LOG_DIR = Path.home() / ".orbit"
+MCP_STDERR_PATH = MCP_LOG_DIR / "mcp-stderr.log"
+MCP_STDERR_TAIL_LINES = 40
 
 
 class MCPError(RuntimeError):
@@ -20,6 +26,40 @@ class MCPToolResult:
     is_error: bool = False
 
 
+def _server_environment() -> dict[str, str]:
+    """Forward Orbit/ML configuration that MCP's safe default env omits."""
+    env = {
+        "PYTHONFAULTHANDLER": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    forwarded_names = {
+        "SENTENCE_TRANSFORMERS_HOME",
+        "TORCH_HOME",
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_PATH",
+        "CUDA_HOME",
+        "PYTORCH_CUDA_ALLOC_CONF",
+    }
+    for name, value in os.environ.items():
+        if (
+            name.startswith("ORBIT_")
+            or name.startswith("HF_")
+            or name.startswith("TRANSFORMERS_")
+            or name in forwarded_names
+        ):
+            env[name] = value
+    return env
+
+
+def _stderr_tail() -> str:
+    try:
+        text = MCP_STDERR_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-MCP_STDERR_TAIL_LINES:])
+
+
 class OrbitMCPClient:
     def __init__(self) -> None:
         self._stack: AsyncExitStack | None = None
@@ -28,12 +68,18 @@ class OrbitMCPClient:
     async def __aenter__(self) -> "OrbitMCPClient":
         stack = AsyncExitStack()
         try:
+            MCP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            errlog = stack.enter_context(
+                MCP_STDERR_PATH.open("w", encoding="utf-8", buffering=1)
+            )
             read_stream, write_stream = await stack.enter_async_context(
                 stdio_client(
                     StdioServerParameters(
                         command=sys.executable,
-                        args=["-m", "orbit.mcp_server"],
-                    )
+                        args=["-X", "faulthandler", "-u", "-m", "orbit.mcp_server"],
+                        env=_server_environment(),
+                    ),
+                    errlog=errlog,
                 )
             )
             session = await stack.enter_async_context(
@@ -42,7 +88,9 @@ class OrbitMCPClient:
             await session.initialize()
         except Exception as exc:
             await stack.aclose()
-            raise MCPError(f"Could not start Orbit MCP server: {exc}") from exc
+            stderr = _stderr_tail()
+            detail = f"\nMCP server stderr:\n{stderr}" if stderr else ""
+            raise MCPError(f"Could not start Orbit MCP server: {exc}{detail}") from exc
 
         self._stack = stack
         self._session = session
@@ -63,7 +111,9 @@ class OrbitMCPClient:
         try:
             result = await self._require_session().list_tools()
         except Exception as exc:
-            raise MCPError(f"Could not list MCP tools: {exc}") from exc
+            stderr = _stderr_tail()
+            detail = f"\nMCP server stderr:\n{stderr}" if stderr else ""
+            raise MCPError(f"Could not list MCP tools: {exc}{detail}") from exc
 
         tools: list[dict[str, Any]] = []
         for tool in result.tools:
@@ -87,7 +137,9 @@ class OrbitMCPClient:
         try:
             result = await self._require_session().call_tool(name, arguments=arguments)
         except Exception as exc:
-            raise MCPError(f"Tool '{name}' failed: {exc}") from exc
+            stderr = _stderr_tail()
+            detail = f"\nMCP server stderr:\n{stderr}" if stderr else ""
+            raise MCPError(f"Tool '{name}' failed: {exc}{detail}") from exc
 
         text_parts: list[str] = []
         for item in result.content:
