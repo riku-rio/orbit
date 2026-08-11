@@ -15,6 +15,7 @@ DEFAULT_MAX_MEMORY_TOKENS = 480
 DEFAULT_MAX_QUERY_TOKENS = 480
 DEFAULT_RERANK_BATCH_SIZE = 8
 DEFAULT_QDRANT_TIMEOUT_SECONDS = 5.0
+DEFAULT_MEMORY_DEVICE = "cpu"
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -53,15 +54,17 @@ class MemoryConfig:
     max_query_tokens: int = DEFAULT_MAX_QUERY_TOKENS
     rerank_batch_size: int = DEFAULT_RERANK_BATCH_SIZE
     qdrant_timeout_seconds: float = DEFAULT_QDRANT_TIMEOUT_SECONDS
-    device: str | None = None
+    device: str | None = DEFAULT_MEMORY_DEVICE
 
     @classmethod
     def from_env(cls) -> "MemoryConfig":
-        device = os.getenv("ORBIT_MEMORY_DEVICE")
-        if device is not None:
-            device = device.strip() or None
-        if device == "auto":
-            device = None
+        raw_device = os.getenv("ORBIT_MEMORY_DEVICE")
+        if raw_device is None or not raw_device.strip():
+            device: str | None = DEFAULT_MEMORY_DEVICE
+        else:
+            device = raw_device.strip().lower()
+            if device == "auto":
+                device = None
 
         max_result_limit = _env_int(
             "ORBIT_MEMORY_MAX_RESULT_LIMIT", DEFAULT_MAX_RESULT_LIMIT
