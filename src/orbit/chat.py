@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from time import perf_counter
+from typing import Any
 
 import typer
 from rich.live import Live
 
-from orbit.ollama import ChatChunk, OllamaClient, OllamaError
+from orbit.mcp_client import MCPError, OrbitMCPClient
+from orbit.ollama import ChatChunk, OllamaClient, OllamaError, ToolCall
 from orbit.rendering import MarkdownStreamRenderer
 from orbit.settings import Settings
 from orbit.ui import (
@@ -20,11 +22,15 @@ from orbit.ui import (
     render_height,
     request_header,
     session_status,
+    tool_completed,
+    tool_failed,
+    tool_started,
 )
 
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
 VIEW_COMMAND = "/view"
 HELP_COMMAND = "/help"
+MAX_TOOL_ROUNDS = 8
 
 
 def ensure_model_loaded(client: OllamaClient, settings: Settings) -> int | None:
@@ -41,12 +47,6 @@ def ensure_model_loaded(client: OllamaClient, settings: Settings) -> int | None:
         client.load_model(settings.model, settings.ollama_load_options())
 
     return client.model_context_length(settings.model)
-
-
-def _duration_seconds(chunk: ChatChunk | None, started_at: float) -> float:
-    if chunk is not None and chunk.total_duration_ns is not None:
-        return chunk.total_duration_ns / 1_000_000_000
-    return perf_counter() - started_at
 
 
 def _context_used(chunk: ChatChunk | None, context_total: int | None) -> int | None:
@@ -71,16 +71,39 @@ def _show_status(model: str, context_used: int, context_total: int | None) -> No
     console.print(session_status(model, context_used, context_total))
 
 
-def run_chat(
+def _assistant_message(
+    thinking: str,
+    content: str,
+    tool_calls: list[ToolCall],
+) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content,
+    }
+    if thinking:
+        message["thinking"] = thinking
+    if tool_calls:
+        message["tool_calls"] = [call.as_ollama_message() for call in tool_calls]
+    return message
+
+
+async def run_chat(
     client: OllamaClient,
     settings: Settings,
+    mcp_client: OrbitMCPClient,
     *,
     render_markdown: bool | None = None,
 ) -> None:
     if settings.model is None:
         raise ValueError("A model must be selected before starting chat.")
 
-    messages: list[dict[str, str]] = []
+    try:
+        tools = await mcp_client.list_ollama_tools()
+    except MCPError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        return
+
+    messages: list[dict[str, Any]] = []
     view_mode = ViewMode.CONCISE
     context_used = 0
 
@@ -123,73 +146,132 @@ def run_chat(
 
         clear_typed_prompt(prompt)
         console.print(request_header(prompt, view_mode))
+
+        turn_message_start = len(messages)
         messages.append({"role": "user", "content": prompt})
 
-        assistant_parts: list[str] = []
-        thinking_parts: list[str] = []
         final_chunk: ChatChunk | None = None
-        started_at = perf_counter()
-        answer_started = False
         renderer = MarkdownStreamRenderer(console, render_markdown=render_markdown)
-
-        live: Live | None = None
-        live_active = False
-        live_rows = 0
+        tool_rounds = 0
+        generation_duration_ns = 0
+        turn_started_at = perf_counter()
 
         try:
             loaded_context = ensure_model_loaded(client, settings)
             if loaded_context is not None:
                 context_total = loaded_context
 
-            if console.is_terminal:
-                progress = generation_progress()
-                renderable = generation_renderable(progress, "", view_mode)
-                live_rows = render_height(renderable)
-                live = Live(
-                    renderable,
-                    console=console,
-                    refresh_per_second=12,
-                    transient=False,
-                    vertical_overflow="ellipsis",
-                )
-                live.start()
-                live_active = True
+            while True:
+                thinking_parts: list[str] = []
+                content_parts: list[str] = []
+                tool_calls: list[ToolCall] = []
+                round_final_chunk: ChatChunk | None = None
+                answer_started = False
 
-            try:
-                for chunk in client.chat(
-                    settings.model,
-                    messages,
-                    settings.ollama_options(),
-                ):
-                    final_chunk = chunk
+                live: Live | None = None
+                live_active = False
+                live_rows = 0
 
-                    if chunk.thinking and not answer_started:
-                        thinking_parts.append(chunk.thinking)
-                        if live_active and live is not None:
-                            renderable = generation_renderable(
-                                progress,
-                                "".join(thinking_parts),
-                                view_mode,
-                            )
-                            live_rows = render_height(renderable)
-                            live.update(renderable, refresh=True)
+                if console.is_terminal:
+                    progress = generation_progress()
+                    renderable = generation_renderable(progress, "", view_mode)
+                    live_rows = render_height(renderable)
+                    live = Live(
+                        renderable,
+                        console=console,
+                        refresh_per_second=12,
+                        transient=False,
+                        vertical_overflow="ellipsis",
+                    )
+                    live.start()
+                    live_active = True
 
-                    if chunk.content:
-                        if not answer_started:
-                            answer_started = True
+                try:
+                    for chunk in client.chat(
+                        settings.model,
+                        messages,
+                        settings.ollama_options(),
+                        tools=tools,
+                    ):
+                        round_final_chunk = chunk
+
+                        if chunk.thinking and not answer_started:
+                            thinking_parts.append(chunk.thinking)
                             if live_active and live is not None:
-                                live.stop()
-                                live_active = False
-                                clear_rendered_block(live_rows)
-                            renderer.start()
-                        assistant_parts.append(chunk.content)
-                        renderer.feed(chunk.content)
-            finally:
-                if live_active and live is not None:
-                    live.stop()
-                    live_active = False
-                    clear_rendered_block(live_rows)
+                                renderable = generation_renderable(
+                                    progress,
+                                    "".join(thinking_parts),
+                                    view_mode,
+                                )
+                                live_rows = render_height(renderable)
+                                live.update(renderable, refresh=True)
+
+                        if chunk.tool_calls:
+                            tool_calls.extend(chunk.tool_calls)
+
+                        if chunk.content:
+                            if not answer_started:
+                                answer_started = True
+                                if live_active and live is not None:
+                                    live.stop()
+                                    live_active = False
+                                    clear_rendered_block(live_rows)
+                                renderer.start()
+                            content_parts.append(chunk.content)
+                            renderer.feed(chunk.content)
+                finally:
+                    if live_active and live is not None:
+                        live.stop()
+                        clear_rendered_block(live_rows)
+
+                if round_final_chunk is not None and round_final_chunk.total_duration_ns is not None:
+                    generation_duration_ns += round_final_chunk.total_duration_ns
+                final_chunk = round_final_chunk
+
+                thinking = "".join(thinking_parts)
+                content = "".join(content_parts)
+                messages.append(_assistant_message(thinking, content, tool_calls))
+
+                if not tool_calls:
+                    break
+
+                tool_rounds += 1
+                if tool_rounds > MAX_TOOL_ROUNDS:
+                    raise OllamaError(
+                        f"Tool call limit exceeded ({MAX_TOOL_ROUNDS} rounds)."
+                    )
+
+                if renderer.wrote_output:
+                    renderer.ensure_line_break()
+
+                for call in tool_calls:
+                    console.print(tool_started(call.name))
+                    started_at = perf_counter()
+                    try:
+                        result = await mcp_client.call_tool(call.name, call.arguments)
+                    except MCPError as exc:
+                        elapsed = perf_counter() - started_at
+                        console.print(tool_failed(elapsed))
+                        result_content = f"Tool error: {exc}"
+                    else:
+                        elapsed = perf_counter() - started_at
+                        if result.is_error:
+                            console.print(tool_failed(elapsed))
+                        else:
+                            console.print(tool_completed(elapsed))
+                        result_content = result.content
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_name": call.name,
+                            "content": result_content,
+                        }
+                    )
+
+                typer.echo()
         except KeyboardInterrupt:
+            del messages[turn_message_start:]
             renderer.abort()
             if renderer.wrote_output:
                 renderer.ensure_line_break()
@@ -197,7 +279,7 @@ def run_chat(
                 typer.echo()
             return
         except OllamaError as exc:
-            messages.pop()
+            del messages[turn_message_start:]
             renderer.abort()
             if renderer.wrote_output:
                 renderer.ensure_line_break()
@@ -206,7 +288,6 @@ def run_chat(
             _show_status(settings.model, context_used, context_total)
             continue
 
-        answer = "".join(assistant_parts)
         renderer.finish()
         renderer.ensure_line_break()
 
@@ -214,7 +295,11 @@ def run_chat(
         if measured_context is not None:
             context_used = measured_context
 
-        console.print(duration_footer(_duration_seconds(final_chunk, started_at)))
+        duration_seconds = (
+            generation_duration_ns / 1_000_000_000
+            if generation_duration_ns > 0
+            else perf_counter() - turn_started_at
+        )
+        console.print(duration_footer(duration_seconds))
         typer.echo()
         _show_status(settings.model, context_used, context_total)
-        messages.append({"role": "assistant", "content": answer})
