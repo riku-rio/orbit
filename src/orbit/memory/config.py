@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 
 DEFAULT_QDRANT_URL = "http://127.0.0.1:6333"
-DEFAULT_COLLECTION_NAME = "orbit_memory_v1"
+DEFAULT_COLLECTION_NAME = "orbit_memory"
 DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_VECTOR_SIZE = 1024
