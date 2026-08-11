@@ -7,6 +7,12 @@ from orbit.memory.config import MemoryConfig
 from orbit.memory.errors import MemoryModelError, MemoryValidationError
 
 
+def _exception_detail(exc: Exception) -> str:
+    message = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
+
+
 class MemoryModels:
     """Lazy local-only embedding and reranking models."""
 
@@ -35,7 +41,8 @@ class MemoryModels:
                 raise MemoryModelError(
                     "Could not load local embedding model "
                     f"'{self.config.embedding_model}'. Ensure it exists in the local "
-                    "Hugging Face cache."
+                    "Hugging Face cache. "
+                    f"Underlying error: {_exception_detail(exc)}"
                 ) from exc
 
             dimension = model.get_embedding_dimension()
@@ -66,7 +73,8 @@ class MemoryModels:
                 raise MemoryModelError(
                     "Could not load local reranker model "
                     f"'{self.config.reranker_model}'. Ensure it exists in the local "
-                    "Hugging Face cache."
+                    "Hugging Face cache. "
+                    f"Underlying error: {_exception_detail(exc)}"
                 ) from exc
 
             self._reranker = model
@@ -84,7 +92,9 @@ class MemoryModels:
                 return_token_type_ids=False,
             )
         except Exception as exc:
-            raise MemoryModelError("Could not tokenize memory input.") from exc
+            raise MemoryModelError(
+                f"Could not tokenize memory input: {_exception_detail(exc)}"
+            ) from exc
 
         input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
         if input_ids is None:
@@ -120,7 +130,9 @@ class MemoryModels:
             )
             return vector.tolist()
         except Exception as exc:
-            raise MemoryModelError("Could not embed memory text.") from exc
+            raise MemoryModelError(
+                f"Could not embed memory text: {_exception_detail(exc)}"
+            ) from exc
 
     def embed_query(self, query: str) -> list[float]:
         model = self._get_embedder()
@@ -138,7 +150,9 @@ class MemoryModels:
             )
             return vector.tolist()
         except Exception as exc:
-            raise MemoryModelError("Could not embed memory query.") from exc
+            raise MemoryModelError(
+                f"Could not embed memory query: {_exception_detail(exc)}"
+            ) from exc
 
     def rerank(self, query: str, passages: Sequence[str]) -> list[float]:
         if not passages:
@@ -154,7 +168,9 @@ class MemoryModels:
                 convert_to_numpy=True,
             )
         except Exception as exc:
-            raise MemoryModelError("Could not rerank memory candidates.") from exc
+            raise MemoryModelError(
+                f"Could not rerank memory candidates: {_exception_detail(exc)}"
+            ) from exc
 
         if getattr(scores, "ndim", 1) > 1:
             scores = scores.reshape(-1)
