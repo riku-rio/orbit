@@ -3,8 +3,9 @@ from __future__ import annotations
 from mcp.server import MCPServer
 
 from orbit.mcp_tools import register_tools
+from orbit.runtime import orbit_lifespan
 
-mcp = MCPServer("orbit")
+mcp = MCPServer("orbit", lifespan=orbit_lifespan)
 register_tools(mcp)
 
 
