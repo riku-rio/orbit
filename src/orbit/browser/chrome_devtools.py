@@ -34,6 +34,14 @@ class ChromeToolResult:
     is_error: bool = False
 
 
+@dataclass
+class _ChromeRequest:
+    kind: str
+    future: asyncio.Future[Any]
+    name: str | None = None
+    arguments: dict[str, Any] | None = None
+
+
 def _server_environment() -> dict[str, str]:
     """Pass only environment needed to discover Node, Chrome, and user paths."""
     allowed_names = {
@@ -139,7 +147,17 @@ def _stderr_tail(path: Path) -> str:
 
 
 class ChromeDevToolsClient:
-    """Lazy stdio client for one isolated Chrome DevTools MCP child server."""
+    """Lazy stdio client owned by one long-lived asyncio task.
+
+    AnyIO's stdio transport opens a task-group cancel scope that must be exited
+    by the same task that entered it. Orbit receives MCP requests and lifespan
+    shutdown in different tasks, so keeping AsyncExitStack on the caller task
+    causes ``Attempted to exit cancel scope in a different task`` on shutdown.
+
+    This client therefore owns the entire child MCP lifecycle inside one runner
+    task. Public methods only enqueue work and await a Future, so start/call/close
+    are safe when invoked by different Orbit request tasks.
+    """
 
     def __init__(
         self,
@@ -160,9 +178,12 @@ class ChromeDevToolsClient:
         self._headless = headless
         self._full_browser = full_browser
         self._tool_timeout_seconds = tool_timeout_seconds
-        self._stack: AsyncExitStack | None = None
-        self._session: ClientSession | None = None
-        self._start_lock = asyncio.Lock()
+
+        self._state_lock = asyncio.Lock()
+        self._runner_task: asyncio.Task[None] | None = None
+        self._requests: asyncio.Queue[_ChromeRequest] | None = None
+        self._ready: asyncio.Future[None] | None = None
+        self._close_waiter: asyncio.Future[Any] | None = None
 
     @classmethod
     def for_agent_browser(cls) -> "ChromeDevToolsClient":
@@ -173,95 +194,261 @@ class ChromeDevToolsClient:
             full_browser=True,
         )
 
-    async def start(self) -> None:
-        if self._session is not None:
-            return
+    def _startup_error(self, exc: BaseException) -> ChromeDevToolsError:
+        stderr = _stderr_tail(self._stderr_path)
+        detail = f"\nChrome DevTools MCP stderr:\n{stderr}" if stderr else ""
+        return ChromeDevToolsError(
+            "Could not start Chrome DevTools MCP. "
+            "Install Node.js/npm and Google Chrome, then retry. "
+            f"Underlying error: {exc}{detail}"
+        )
 
-        async with self._start_lock:
-            if self._session is not None:
+    def _request_error(
+        self,
+        request: _ChromeRequest,
+        exc: BaseException,
+    ) -> ChromeDevToolsError:
+        if isinstance(exc, asyncio.TimeoutError):
+            if request.kind == "list_tools":
+                return ChromeDevToolsError(
+                    "Chrome DevTools tool discovery timed out after "
+                    f"{self._tool_timeout_seconds:g}s."
+                )
+            return ChromeDevToolsError(
+                f"Chrome DevTools tool '{request.name}' timed out after "
+                f"{self._tool_timeout_seconds:g}s."
+            )
+
+        stderr = _stderr_tail(self._stderr_path)
+        detail = f"\nChrome DevTools MCP stderr:\n{stderr}" if stderr else ""
+        if request.kind == "list_tools":
+            return ChromeDevToolsError(
+                f"Could not list Chrome DevTools tools: {exc}{detail}"
+            )
+        return ChromeDevToolsError(
+            f"Chrome DevTools tool '{request.name}' failed: {exc}{detail}"
+        )
+
+    @staticmethod
+    def _set_result(future: asyncio.Future[Any], value: Any) -> None:
+        if not future.done():
+            future.set_result(value)
+
+    @staticmethod
+    def _set_exception(
+        future: asyncio.Future[Any],
+        error: BaseException,
+    ) -> None:
+        if not future.done():
+            future.set_exception(error)
+
+    def _fail_pending(
+        self,
+        requests: asyncio.Queue[_ChromeRequest],
+        error: BaseException,
+    ) -> None:
+        while True:
+            try:
+                request = requests.get_nowait()
+            except asyncio.QueueEmpty:
                 return
+            self._set_exception(request.future, error)
+
+    async def _run(
+        self,
+        requests: asyncio.Queue[_ChromeRequest],
+        ready: asyncio.Future[None],
+    ) -> None:
+        stack = AsyncExitStack()
+        close_request: _ChromeRequest | None = None
+        failure: BaseException | None = None
+        try:
             if shutil.which("npx") is None:
                 raise ChromeDevToolsError(
                     "Chrome DevTools MCP requires Node.js/npm (npx was not found in PATH)."
                 )
 
-            stack = AsyncExitStack()
-            try:
-                BROWSER_LOG_DIR.mkdir(parents=True, exist_ok=True)
-                self._profile_path.mkdir(parents=True, exist_ok=True)
-                errlog = stack.enter_context(
-                    self._stderr_path.open("w", encoding="utf-8", buffering=1)
-                )
-                command, args = _server_command(
-                    self._package,
-                    self._profile_path,
-                    headless=self._headless,
-                    full_browser=self._full_browser,
-                    enable_screencast=(
-                        self._full_browser and shutil.which("ffmpeg") is not None
+            BROWSER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self._profile_path.mkdir(parents=True, exist_ok=True)
+            errlog = stack.enter_context(
+                self._stderr_path.open("w", encoding="utf-8", buffering=1)
+            )
+            command, args = _server_command(
+                self._package,
+                self._profile_path,
+                headless=self._headless,
+                full_browser=self._full_browser,
+                enable_screencast=(
+                    self._full_browser and shutil.which("ffmpeg") is not None
+                ),
+            )
+            read_stream, write_stream = await stack.enter_async_context(
+                stdio_client(
+                    StdioServerParameters(
+                        command=command,
+                        args=args,
+                        env=_server_environment(),
                     ),
+                    errlog=errlog,
                 )
-                read_stream, write_stream = await stack.enter_async_context(
-                    stdio_client(
-                        StdioServerParameters(
-                            command=command,
-                            args=args,
-                            env=_server_environment(),
-                        ),
-                        errlog=errlog,
-                    )
-                )
-                session = await stack.enter_async_context(
-                    ClientSession(read_stream, write_stream)
-                )
-                await session.initialize()
-            except Exception as exc:
-                await stack.aclose()
-                stderr = _stderr_tail(self._stderr_path)
-                detail = (
-                    f"\nChrome DevTools MCP stderr:\n{stderr}" if stderr else ""
-                )
-                raise ChromeDevToolsError(
-                    "Could not start Chrome DevTools MCP. "
-                    "Install Node.js/npm and Google Chrome, then retry. "
-                    f"Underlying error: {exc}{detail}"
-                ) from exc
+            )
+            session = await stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await session.initialize()
+            self._set_result(ready, None)
 
-            self._stack = stack
-            self._session = session
+            while True:
+                request = await requests.get()
+                if request.kind == "close":
+                    close_request = request
+                    break
+
+                try:
+                    if request.kind == "list_tools":
+                        result = await asyncio.wait_for(
+                            session.list_tools(),
+                            timeout=self._tool_timeout_seconds,
+                        )
+                    elif request.kind == "call_tool":
+                        result = await asyncio.wait_for(
+                            session.call_tool(
+                                request.name or "",
+                                arguments=request.arguments or {},
+                            ),
+                            timeout=self._tool_timeout_seconds,
+                        )
+                    else:  # pragma: no cover - internal invariant
+                        raise RuntimeError(f"Unknown Chrome request: {request.kind}")
+                except Exception as exc:
+                    failure = self._request_error(request, exc)
+                    self._set_exception(request.future, failure)
+                    break
+                else:
+                    self._set_result(request.future, result)
+        except asyncio.CancelledError:
+            failure = ChromeDevToolsError("Chrome DevTools MCP runner was cancelled.")
+            if not ready.done():
+                ready.cancel()
+            raise
+        except Exception as exc:
+            if isinstance(exc, ChromeDevToolsError):
+                failure = exc
+            else:
+                failure = self._startup_error(exc)
+            if not ready.done():
+                self._set_exception(ready, failure)
+        finally:
+            if failure is not None:
+                self._fail_pending(requests, failure)
+
+            cleanup_error: BaseException | None = None
+            try:
+                # Critical: all AsyncExitStack callbacks run in this same owner
+                # task, matching the task that entered stdio_client/ClientSession.
+                await stack.aclose()
+            except Exception as exc:  # pragma: no cover - defensive cleanup path
+                cleanup_error = ChromeDevToolsError(
+                    f"Could not close Chrome DevTools MCP cleanly: {exc}"
+                )
+
+            if close_request is not None:
+                if cleanup_error is None:
+                    self._set_result(close_request.future, None)
+                else:
+                    self._set_exception(close_request.future, cleanup_error)
+            elif cleanup_error is not None and failure is None:
+                self._fail_pending(requests, cleanup_error)
+
+    async def start(self) -> None:
+        async with self._state_lock:
+            task = self._runner_task
+            if task is None or task.done():
+                loop = asyncio.get_running_loop()
+                requests: asyncio.Queue[_ChromeRequest] = asyncio.Queue()
+                ready: asyncio.Future[None] = loop.create_future()
+                task = asyncio.create_task(
+                    self._run(requests, ready),
+                    name="orbit-chrome-devtools",
+                )
+                self._runner_task = task
+                self._requests = requests
+                self._ready = ready
+                self._close_waiter = None
+            ready = self._ready
+
+        if ready is None:  # pragma: no cover - internal invariant
+            raise ChromeDevToolsError("Chrome DevTools MCP runner did not initialize.")
+        await ready
+
+    async def _submit(
+        self,
+        kind: str,
+        *,
+        name: str | None = None,
+        arguments: dict[str, Any] | None = None,
+    ) -> Any:
+        await self.start()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+
+        async with self._state_lock:
+            task = self._runner_task
+            requests = self._requests
+            closing = self._close_waiter is not None
+            if task is None or task.done() or requests is None or closing:
+                raise ChromeDevToolsError("Chrome DevTools MCP is not connected.")
+            requests.put_nowait(
+                _ChromeRequest(
+                    kind=kind,
+                    future=future,
+                    name=name,
+                    arguments=arguments,
+                )
+            )
+
+        try:
+            return await future
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
 
     async def close(self) -> None:
-        async with self._start_lock:
-            if self._stack is not None:
-                await self._stack.aclose()
-            self._stack = None
-            self._session = None
+        async with self._state_lock:
+            task = self._runner_task
+            requests = self._requests
+            if task is None:
+                return
+            if task.done():
+                self._runner_task = None
+                self._requests = None
+                self._ready = None
+                self._close_waiter = None
+                return
 
-    def _require_session(self) -> ClientSession:
-        if self._session is None:
-            raise ChromeDevToolsError("Chrome DevTools MCP is not connected.")
-        return self._session
+            close_waiter = self._close_waiter
+            if close_waiter is None:
+                if requests is None:  # pragma: no cover - internal invariant
+                    return
+                close_waiter = asyncio.get_running_loop().create_future()
+                self._close_waiter = close_waiter
+                requests.put_nowait(
+                    _ChromeRequest(kind="close", future=close_waiter)
+                )
+
+        try:
+            await close_waiter
+            await asyncio.shield(task)
+        finally:
+            async with self._state_lock:
+                if self._runner_task is task and task.done():
+                    self._runner_task = None
+                    self._requests = None
+                    self._ready = None
+                    self._close_waiter = None
 
     async def list_tools(self) -> list[Any]:
-        await self.start()
-        try:
-            result = await asyncio.wait_for(
-                self._require_session().list_tools(),
-                timeout=self._tool_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            await self.close()
-            raise ChromeDevToolsError(
-                "Chrome DevTools tool discovery timed out after "
-                f"{self._tool_timeout_seconds:g}s."
-            ) from exc
-        except Exception as exc:
-            stderr = _stderr_tail(self._stderr_path)
-            await self.close()
-            detail = f"\nChrome DevTools MCP stderr:\n{stderr}" if stderr else ""
-            raise ChromeDevToolsError(
-                f"Could not list Chrome DevTools tools: {exc}{detail}"
-            ) from exc
+        result = await self._submit("list_tools")
         return list(result.tools)
 
     async def call_tool_raw(
@@ -269,25 +456,11 @@ class ChromeDevToolsClient:
         name: str,
         arguments: dict[str, Any],
     ) -> Any:
-        await self.start()
-        try:
-            return await asyncio.wait_for(
-                self._require_session().call_tool(name, arguments=arguments),
-                timeout=self._tool_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            await self.close()
-            raise ChromeDevToolsError(
-                f"Chrome DevTools tool '{name}' timed out after "
-                f"{self._tool_timeout_seconds:g}s."
-            ) from exc
-        except Exception as exc:
-            stderr = _stderr_tail(self._stderr_path)
-            await self.close()
-            detail = f"\nChrome DevTools MCP stderr:\n{stderr}" if stderr else ""
-            raise ChromeDevToolsError(
-                f"Chrome DevTools tool '{name}' failed: {exc}{detail}"
-            ) from exc
+        return await self._submit(
+            "call_tool",
+            name=name,
+            arguments=arguments,
+        )
 
     async def call_tool(
         self,
