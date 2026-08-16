@@ -31,7 +31,7 @@ from orbit.ui import (
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
 VIEW_COMMAND = "/view"
 HELP_COMMAND = "/help"
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 16
 
 
 def ensure_model_loaded(client: OllamaClient, settings: Settings) -> int | None:
@@ -91,6 +91,21 @@ def _assistant_message(
         message["thinking"] = thinking
     if tool_calls:
         message["tool_calls"] = [call.as_ollama_message() for call in tool_calls]
+    return message
+
+
+def _tool_message(
+    tool_name: str,
+    content: str,
+    images: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "role": "tool",
+        "tool_name": tool_name,
+        "content": content,
+    }
+    if images:
+        message["images"] = list(images)
     return message
 
 
@@ -233,7 +248,10 @@ async def run_chat(
                         live.stop()
                         clear_rendered_block(live_rows)
 
-                if round_final_chunk is not None and round_final_chunk.total_duration_ns is not None:
+                if (
+                    round_final_chunk is not None
+                    and round_final_chunk.total_duration_ns is not None
+                ):
                     generation_duration_ns += round_final_chunk.total_duration_ns
                 final_chunk = round_final_chunk
 
@@ -256,6 +274,7 @@ async def run_chat(
                 for call in tool_calls:
                     console.print(tool_started(call.name))
                     started_at = perf_counter()
+                    result_images: tuple[str, ...] = ()
                     try:
                         result = await mcp_client.call_tool(call.name, call.arguments)
                     except MCPError as exc:
@@ -271,13 +290,14 @@ async def run_chat(
                         else:
                             console.print(tool_completed(elapsed))
                         result_content = result.content
+                        result_images = result.images
 
                     messages.append(
-                        {
-                            "role": "tool",
-                            "tool_name": call.name,
-                            "content": result_content,
-                        }
+                        _tool_message(
+                            call.name,
+                            result_content,
+                            result_images,
+                        )
                     )
 
                 typer.echo()

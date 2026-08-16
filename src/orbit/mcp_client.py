@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -23,11 +24,12 @@ class MCPError(RuntimeError):
 @dataclass(frozen=True)
 class MCPToolResult:
     content: str
+    images: tuple[str, ...] = ()
     is_error: bool = False
 
 
 def _server_environment() -> dict[str, str]:
-    """Forward Orbit/ML configuration that MCP's safe default env omits."""
+    """Forward Orbit/ML configuration plus executable discovery paths."""
     env = {
         "PYTHONFAULTHANDLER": "1",
         "PYTHONUNBUFFERED": "1",
@@ -38,8 +40,25 @@ def _server_environment() -> dict[str, str]:
         "HF_DEACTIVATE_ASYNC_LOAD": os.getenv("HF_DEACTIVATE_ASYNC_LOAD", "1"),
     }
     forwarded_names = {
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
         "SENTENCE_TRANSFORMERS_HOME",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
         "TORCH_HOME",
+        "USERPROFILE",
+        "WINDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
         "CUDA_VISIBLE_DEVICES",
         "CUDA_PATH",
         "CUDA_HOME",
@@ -50,7 +69,7 @@ def _server_environment() -> dict[str, str]:
             name.startswith("ORBIT_")
             or name.startswith("HF_")
             or name.startswith("TRANSFORMERS_")
-            or name in forwarded_names
+            or name.upper() in forwarded_names
         ):
             env[name] = value
     return env
@@ -63,6 +82,58 @@ def _stderr_tail() -> str:
         return ""
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines[-MCP_STDERR_TAIL_LINES:])
+
+
+def _dump_content_item(item: Any) -> str:
+    model_dump = getattr(item, "model_dump", None)
+    if callable(model_dump):
+        try:
+            payload = model_dump(mode="json", by_alias=True, exclude_none=True)
+            return json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+    return str(item)
+
+
+def _tool_result_from_mcp(result: Any) -> MCPToolResult:
+    content_parts: list[str] = []
+    images: list[str] = []
+
+    for item in result.content:
+        item_type = getattr(item, "type", None)
+        if item_type == "image":
+            data = getattr(item, "data", None)
+            if isinstance(data, str) and data:
+                images.append(data)
+                continue
+            if isinstance(data, bytes) and data:
+                images.append(base64.b64encode(data).decode("ascii"))
+                continue
+
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            content_parts.append(text)
+            continue
+
+        # Chrome DevTools currently returns text/image content, but preserve any
+        # future MCP content kinds as compact JSON instead of silently dropping them.
+        content_parts.append(_dump_content_item(item))
+
+    if content_parts:
+        content = "\n".join(content_parts)
+    else:
+        structured = getattr(result, "structured_content", None)
+        content = (
+            json.dumps(structured, ensure_ascii=False)
+            if structured is not None
+            else ""
+        )
+
+    return MCPToolResult(
+        content=content,
+        images=tuple(images),
+        is_error=result.is_error is True,
+    )
 
 
 class OrbitMCPClient:
@@ -146,16 +217,4 @@ class OrbitMCPClient:
             detail = f"\nMCP server stderr:\n{stderr}" if stderr else ""
             raise MCPError(f"Tool '{name}' failed: {exc}{detail}") from exc
 
-        text_parts: list[str] = []
-        for item in result.content:
-            text = getattr(item, "text", None)
-            if isinstance(text, str):
-                text_parts.append(text)
-
-        if text_parts:
-            content = "\n".join(text_parts)
-        else:
-            structured = getattr(result, "structured_content", None)
-            content = json.dumps(structured, ensure_ascii=False) if structured is not None else ""
-
-        return MCPToolResult(content=content, is_error=result.is_error is True)
+        return _tool_result_from_mcp(result)
