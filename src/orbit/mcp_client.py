@@ -29,7 +29,7 @@ class MCPToolResult:
 
 
 def _server_environment() -> dict[str, str]:
-    """Forward Orbit/ML configuration plus executable discovery paths."""
+    """Forward Orbit/ML configuration plus executable and display discovery paths."""
     env = {
         "PYTHONFAULTHANDLER": "1",
         "PYTHONUNBUFFERED": "1",
@@ -42,6 +42,7 @@ def _server_environment() -> dict[str, str]:
     forwarded_names = {
         "APPDATA",
         "COMSPEC",
+        "DISPLAY",
         "HOME",
         "LOCALAPPDATA",
         "PATH",
@@ -56,7 +57,9 @@ def _server_environment() -> dict[str, str]:
         "TMP",
         "TORCH_HOME",
         "USERPROFILE",
+        "WAYLAND_DISPLAY",
         "WINDIR",
+        "XAUTHORITY",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "CUDA_VISIBLE_DEVICES",
