@@ -426,10 +426,7 @@ class WebSearchService:
                 extracted = await self._call(
                     client,
                     "evaluate_script",
-                    {
-                        "function": GOOGLE_RESULTS_EXTRACTOR,
-                        "waitForStableDom": False,
-                    },
+                    {"function": GOOGLE_RESULTS_EXTRACTOR},
                 )
                 payload = _evaluate_payload(extracted.content)
                 return _response_from_payload(
